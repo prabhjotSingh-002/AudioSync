@@ -10,17 +10,13 @@ const getSocket = () => {
         const explicitUrl = import.meta.env.VITE_SIGNALING_SERVER_URL || '';
 
         if (explicitUrl && !explicitUrl.includes('localhost')) {
-            // Explicit non-localhost URL set (ngrok, production deployment, etc.)
+            // Explicit production deployment URL (e.g. Railway / Render / ngrok)
             serverUrl = explicitUrl;
-        } else if (window.location.port === '3001' || window.location.port === '') {
-            // Page is being served BY the signaling server itself (single-port mode).
-            // Connect to same origin — works for ngrok, LAN IP, public IP, all at once.
-            serverUrl = window.location.origin;
         } else {
-            // Dev mode: Vite (5173/5174) serves the client, server on 3001.
-            // Use same hostname but port 3001.
-            const hostname = window.location.hostname;
-            serverUrl = `http://${hostname}:3001`;
+            // Dev mode or single-port mode:
+            // Connect to window.location.origin so Socket.io routes through
+            // Vite's HTTPS proxy (/socket.io -> 3001). This eliminates Mixed Content errors on mobile!
+            serverUrl = window.location.origin;
         }
 
         console.log('[Socket] Connecting to:', serverUrl);

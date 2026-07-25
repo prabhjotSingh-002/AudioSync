@@ -21,7 +21,7 @@ const ICE_STATE_META = {
 
 export default function Host() {
     // ── State ─────────────────────────────────────────────────────────────────
-    const [roomId] = useState(() => uuidv4()); // stable across re-renders
+    const [roomId] = useState(() => uuidv4()); // STABLE Room ID per host session
     const [roomUrl, setRoomUrl] = useState('');
     const [isCapturing, setIsCapturing] = useState(false);
     const [captureError, setCaptureError] = useState(null);
@@ -32,16 +32,13 @@ export default function Host() {
     const [clients, setClients] = useState(new Map());
 
     // ── Refs ──────────────────────────────────────────────────────────────────
-    // FIX: localStreamRef is kept for imperative track-stopping in stopCapture,
-    //      but localStream STATE is what gets passed to useWebRTC so the hook
-    //      re-runs when the stream becomes available (refs don't trigger re-renders).
-    const localStreamRef = useRef(null); // MediaStream from getDisplayMedia (imperative use)
+    const localStreamRef = useRef(null); // MediaStream from getDisplayMedia
     const audioContextRef = useRef(null); // AudioContext for local monitoring
     const analyserRef = useRef(null); // AnalyserNode for the VU meter
     const animFrameRef = useRef(null); // requestAnimationFrame handle
     const vuCanvasRef = useRef(null); // <canvas> for the VU meter bars
 
-    // FIX: This state drives useWebRTC so it sees the real stream on re-render
+    // State drives useWebRTC so it sees the real stream on re-render
     const [localStream, setLocalStream] = useState(null);
 
     // ── Hooks ─────────────────────────────────────────────────────────────────
@@ -62,26 +59,30 @@ export default function Host() {
 
     useWebRTC({
         socket,
-        localStream,          // FIX: use state, not ref.current
+        localStream,
         onConnectionChange: handleConnectionChange,
     });
 
-    // ── Build room URL ─────────────────────────────────────────────────────────
+    // ── Build room URL whenever roomId changes ─────────────────────────────────
     useEffect(() => {
+        if (!roomId) return;
+
         let base = window.location.origin;
 
-        // If the host is developing on localhost (required for getDisplayMedia to work securely limitlessly),
-        // the generated QR code MUST point to the LAN IP so the phone can scan and reach it over the local network.
-        if (base.includes('localhost') && import.meta.env.VITE_LAN_IP) {
-            base = `http://${import.meta.env.VITE_LAN_IP}:${window.location.port}`;
+        // If host is developing on localhost/127.0.0.1, use LAN IP so mobile QR scan connects to laptop
+        const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+        const lanIp = import.meta.env.VITE_LAN_IP;
+
+        if (isLocalhost && lanIp) {
+            base = `${window.location.protocol}//${lanIp}:${window.location.port}`;
         }
 
         setRoomUrl(`${base}/room/${roomId}`);
     }, [roomId]);
 
-    // ── Join signaling room ────────────────────────────────────────────────────
+    // ── Join signaling room whenever roomId changes ────────────────────────────
     useEffect(() => {
-        if (!socket) return;
+        if (!socket || !roomId) return;
 
         const handleRoomJoined = ({ socketId: sid }) => {
             setSocketId(sid);
@@ -90,14 +91,12 @@ export default function Host() {
         };
 
         const handleClientJoined = ({ clientId }) => {
-            // Pre-populate the client entry so it appears immediately in the UI
             setClients((prev) => new Map(prev).set(clientId, { state: 'checking' }));
         };
 
         socket.on('room-joined', handleRoomJoined);
         socket.on('client-joined', handleClientJoined);
 
-        // Emit join as soon as the socket is connected (or immediately if already connected)
         const joinRoom = () => socket.emit('join-room', { roomId, role: 'host' });
         if (socket.connected) {
             joinRoom();
@@ -122,9 +121,8 @@ export default function Host() {
         const data = new Uint8Array(analyser.frequencyBinCount);
         analyser.getByteFrequencyData(data);
 
-        // Average the first 128 bins (bass + mids) — most musical content
         const avg = data.slice(0, 128).reduce((a, b) => a + b, 0) / 128;
-        const level = avg / 255; // normalise 0–1
+        const level = avg / 255;
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -134,7 +132,7 @@ export default function Host() {
         for (let i = 0; i < barCount; i++) {
             const barLevel = Math.max(0, level - i * (1 / barCount));
             const barH = barLevel * canvas.height * barCount;
-            const hue = 120 - i * (120 / barCount); // green → yellow → red
+            const hue = 120 - i * (120 / barCount);
             ctx.fillStyle = `hsl(${hue}, 85%, 50%)`;
             ctx.fillRect(i * (barW + 2), canvas.height - barH, barW, barH);
         }
@@ -142,24 +140,47 @@ export default function Host() {
         animFrameRef.current = requestAnimationFrame(drawVuMeter);
     }, []);
 
-    // ── Start / Stop audio capture ─────────────────────────────────────────────
+    // ── Stop audio capture (DECLARED FIRST to prevent closure/hoisting bugs) ──
+    const stopCapture = useCallback(() => {
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach((t) => {
+                t.onended = null;
+                t.stop();
+            });
+            localStreamRef.current = null;
+        }
+
+        setLocalStream(null);
+
+        if (animFrameRef.current) {
+            cancelAnimationFrame(animFrameRef.current);
+            animFrameRef.current = null;
+        }
+
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+            audioContextRef.current.close().catch(() => {});
+            audioContextRef.current = null;
+        }
+
+        setIsCapturing(false);
+        console.log('[Host] Audio capture stopped');
+    }, []);
+
+    // ── Start audio capture ────────────────────────────────────────────────────
     const startCapture = useCallback(async () => {
         setCaptureError(null);
 
-        // ── Secure context check ───────────────────────────────────────────────
-        // getDisplayMedia only works on HTTPS or localhost (browser security rule).
-        // With the updated vite.config.js (basicSsl plugin), all URLs are HTTPS
-        // so this should never trigger. Kept as a safety net.
         if (!window.isSecureContext || !navigator.mediaDevices?.getDisplayMedia) {
             setCaptureError(
                 'Audio capture requires a secure connection. ' +
-                'Make sure you opened AudioSync via https:// (not http://). ' +
-                'If you see a certificate warning, click "Advanced → Proceed anyway".'
+                'Make sure you opened AudioSync via https:// (not http://).'
             );
             return;
         }
 
         try {
+            stopCapture();
+
             let stream;
             try {
                 stream = await navigator.mediaDevices.getDisplayMedia({
@@ -168,7 +189,7 @@ export default function Host() {
                         echoCancellation: false,
                         noiseSuppression: false,
                         autoGainControl: false,
-                        suppressLocalAudioPlayback: true,
+                        suppressLocalAudioPlayback: false,
                         sampleRate: 48000,
                         channelCount: 2,
                     },
@@ -196,8 +217,13 @@ export default function Host() {
             analyserRef.current = analyser;
             animFrameRef.current = requestAnimationFrame(drawVuMeter);
 
-            stream.getAudioTracks()[0].onended = stopCapture;
-            console.log('[Host] Audio capture started');
+            // Bind native Chrome "Stop sharing" bar click event
+            stream.getAudioTracks()[0].onended = () => {
+                console.log('[Host] Stream ended natively by user');
+                stopCapture();
+            };
+
+            console.log(`[Host] Audio capture started with fresh Room ID: ${newRoomId}`);
         } catch (err) {
             if (err.name === 'NotAllowedError') {
                 setCaptureError('Permission denied. Please allow screen sharing and check "Share tab audio".');
@@ -209,19 +235,7 @@ export default function Host() {
                 setCaptureError(`Capture failed: ${err.message}`);
             }
         }
-    }, [drawVuMeter]);
-
-    const stopCapture = useCallback(() => {
-        localStreamRef.current?.getTracks().forEach((t) => t.stop());
-        localStreamRef.current = null;
-        setLocalStream(null);  // FIX: clear state so useWebRTC knows stream is gone
-
-        cancelAnimationFrame(animFrameRef.current);
-        audioContextRef.current?.close();
-
-        setIsCapturing(false);
-        console.log('[Host] Audio capture stopped');
-    }, []);
+    }, [drawVuMeter, stopCapture]);
 
     // Cleanup on unmount
     useEffect(() => {
@@ -240,44 +254,62 @@ export default function Host() {
 
             {/* ── Status bar ── */}
             <div style={styles.statusBar}>
-                <StatusDot active={isInRoom} label={isInRoom ? `Signaling ready · ${socketId?.slice(0, 8)}` : 'Connecting to signaling server…'} />
-                <StatusDot active={isCapturing} label={isCapturing ? 'Audio capturing' : 'Audio not started'} />
+                <StatusDot
+                    active={isInRoom && isCapturing}
+                    label={isInRoom && isCapturing ? `Signaling ready · Room: ${roomId.slice(0, 8)}…` : 'Waiting to start audio capture…'}
+                />
+                <StatusDot
+                    active={isCapturing}
+                    label={isCapturing ? 'Audio capturing & streaming' : 'Audio stream offline'}
+                />
             </div>
 
             {/* ── Two-column layout ── */}
             <div style={styles.grid}>
 
-                {/* LEFT: QR Code + URL */}
+                {/* LEFT: QR Code + Room URL (Only active when sharing audio) */}
                 <section style={styles.card}>
-                    <h2 style={styles.cardTitle}>Scan to connect</h2>
-                    <p style={styles.cardSub}>Mobile client scans this QR code to join the room instantly.</p>
+                    <h2 style={styles.cardTitle}>
+                        {isCapturing ? '📲 Scan to connect' : '📲 Room QR Code'}
+                    </h2>
+                    <p style={styles.cardSub}>
+                        {isCapturing
+                            ? 'Scan this QR code with mobile camera to join stream instantly.'
+                            : 'Click "Start Sharing Audio" to generate fresh QR Code & join link.'}
+                    </p>
 
                     <div style={styles.qrWrapper}>
-                        {roomUrl ? (
+                        {isCapturing && roomUrl ? (
                             <QRCodeSVG
                                 value={roomUrl}
                                 size={200}
-                                level="M"              // Error correction level M (15%) — good balance
+                                level="M"
                                 includeMargin={true}
                                 bgColor="transparent"
                                 fgColor="currentColor"
                             />
                         ) : (
-                            <div style={styles.qrPlaceholder}>Generating…</div>
+                            <div style={styles.qrPlaceholder}>
+                                🎧<br />
+                                Click "Start sharing audio" to generate QR Code
+                            </div>
                         )}
                     </div>
 
-                    <div style={styles.urlBox}>
-                        <code style={styles.urlText}>{roomUrl}</code>
-                        <button
-                            style={styles.copyBtn}
-                            onClick={() => navigator.clipboard.writeText(roomUrl)}
-                        >
-                            Copy
-                        </button>
-                    </div>
-
-                    <p style={styles.hint}>Room ID: <code>{roomId.slice(0, 8)}…</code></p>
+                    {isCapturing && roomUrl && (
+                        <>
+                            <div style={styles.urlBox}>
+                                <code style={styles.urlText}>{roomUrl}</code>
+                                <button
+                                    style={styles.copyBtn}
+                                    onClick={() => navigator.clipboard.writeText(roomUrl)}
+                                >
+                                    Copy
+                                </button>
+                            </div>
+                            <p style={styles.hint}>Room ID: <code>{roomId.slice(0, 8)}…</code></p>
+                        </>
+                    )}
                 </section>
 
                 {/* RIGHT: Capture controls + VU meter + client list */}

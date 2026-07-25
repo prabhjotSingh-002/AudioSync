@@ -107,6 +107,36 @@ export const useWebRTC = ({ socket, localStream, onConnectionChange }) => {
     [createPeerConnection, socket]
   );
 
+  // Whenever localStream becomes available or changes, update tracks on all existing peer connections
+  useEffect(() => {
+    if (!localStream) return;
+
+    peerConnections.current.forEach((pc, clientId) => {
+      const senders = pc.getSenders();
+      const hasAudioTrack = senders.some((sender) => sender.track?.kind === 'audio');
+
+      if (!hasAudioTrack) {
+        localStream.getAudioTracks().forEach((track) => {
+          pc.addTrack(track, localStream);
+        });
+
+        (async () => {
+          try {
+            const offer = await pc.createOffer({
+              offerToReceiveAudio: false,
+              offerToReceiveVideo: false,
+            });
+            await pc.setLocalDescription(offer);
+            socket.emit('offer', { targetId: clientId, sdp: offer });
+            console.log(`[Host] Re-negotiated offer with audio track to ${clientId}`);
+          } catch (err) {
+            console.error('[Host] Offer renegotiation error:', err);
+          }
+        })();
+      }
+    });
+  }, [localStream, socket]);
+
   // ── Handler: answer received from a client ────────────────────────────────
   const handleAnswer = useCallback(async ({ sdp, fromId }) => {
     const pc = peerConnections.current.get(fromId);
