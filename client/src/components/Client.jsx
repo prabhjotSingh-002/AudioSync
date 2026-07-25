@@ -14,6 +14,7 @@ const STATE_CONFIG = {
   connected: { label: 'Streaming live', color: '#22c55e', icon: '●', showAudio: true },
   failed: { label: 'Connection failed', color: '#ef4444', icon: '✕', showAudio: false },
   disconnected: { label: 'Host disconnected', color: '#f97316', icon: '◌', showAudio: false },
+  server_offline: { label: 'Server offline / Maintenance', color: '#ef4444', icon: '⚠️', showAudio: false },
 };
 
 // ── Props ─────────────────────────────────────────────────────────────────
@@ -25,6 +26,7 @@ export default function Client({ roomId }) {
   const [isMuted, setIsMuted] = useState(false);
   const [prevVolume, setPrevVolume] = useState(0.8);
   const [connectionState, setConnectionState] = useState('idle');
+  const [isServerOffline, setIsServerOffline] = useState(false);
 
   const vuCanvasRef = useRef(null);
   const socket = useSocket();
@@ -41,11 +43,12 @@ export default function Client({ roomId }) {
     onStateChange: setConnectionState,
   });
 
-  // ── Join the signaling room ────────────────────────────────────────────────
+  // ── Join the signaling room & monitor socket health ────────────────────────
   useEffect(() => {
-    if (!socket || hasJoined) return;
+    if (!socket) return;
 
     const joinRoom = () => {
+      setIsServerOffline(false);
       socket.emit('join-room', { roomId, role: 'client' });
       console.log('[Client] Emitted join-room for', roomId);
     };
@@ -53,10 +56,18 @@ export default function Client({ roomId }) {
     const handleRoomJoined = ({ socketId: sid, participantCount }) => {
       setSocketId(sid);
       setHasJoined(true);
+      setIsServerOffline(false);
       console.log(`[Client] Joined room. Socket: ${sid}, Participants: ${participantCount}`);
     };
 
+    const handleConnectError = () => {
+      console.warn('[Client] Socket connect_error — signaling server offline');
+      setIsServerOffline(true);
+    };
+
     socket.on('room-joined', handleRoomJoined);
+    socket.on('connect_error', handleConnectError);
+    socket.on('disconnect', handleConnectError);
 
     if (socket.connected) {
       joinRoom();
@@ -64,8 +75,18 @@ export default function Client({ roomId }) {
       socket.once('connect', joinRoom);
     }
 
+    // Timer check: if socket fails to connect within 5 seconds, mark server offline
+    const timer = setTimeout(() => {
+      if (!socket.connected && !hasJoined) {
+        setIsServerOffline(true);
+      }
+    }, 5000);
+
     return () => {
+      clearTimeout(timer);
       socket.off('room-joined', handleRoomJoined);
+      socket.off('connect_error', handleConnectError);
+      socket.off('disconnect', handleConnectError);
     };
   }, [socket, roomId, hasJoined]);
 
@@ -160,16 +181,16 @@ export default function Client({ roomId }) {
       </div>
 
       {/* Connection state card */}
-      <div style={{ ...S.stateCard, borderColor: stateConfig.color + '44' }}>
+      <div style={{ ...S.stateCard, borderColor: (isServerOffline ? '#ef4444' : stateConfig.color) + '44' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span style={{ ...S.stateIcon, color: stateConfig.color, animation: connectionState === 'connecting' || connectionState === 'signaling' ? 'spin 1.4s linear infinite' : 'none' }}>
-            {stateConfig.icon}
+          <span style={{ ...S.stateIcon, color: isServerOffline ? '#ef4444' : stateConfig.color, animation: connectionState === 'connecting' || connectionState === 'signaling' ? 'spin 1.4s linear infinite' : 'none' }}>
+            {isServerOffline ? '⚠️' : stateConfig.icon}
           </span>
           <div>
-            <div style={{ ...S.stateLabel, color: stateConfig.color }}>
-              {stateConfig.label}
+            <div style={{ ...S.stateLabel, color: isServerOffline ? '#ef4444' : stateConfig.color }}>
+              {isServerOffline ? 'Server offline / Maintenance' : stateConfig.label}
             </div>
-            {socketId && (
+            {socketId && !isServerOffline && (
               <div style={S.socketHint}>
                 ID: <code style={S.mono}>{socketId.slice(0, 12)}…</code>
               </div>
@@ -177,8 +198,8 @@ export default function Client({ roomId }) {
           </div>
         </div>
 
-        {/* Retry button on failure */}
-        {(connectionState === 'failed' || connectionState === 'disconnected') && (
+        {/* Retry button on failure or server offline */}
+        {(connectionState === 'failed' || connectionState === 'disconnected' || isServerOffline) && (
           <button
             style={S.retryBtn}
             onClick={() => window.location.reload()}
@@ -187,6 +208,40 @@ export default function Client({ roomId }) {
           </button>
         )}
       </div>
+
+      {/* Server Offline / Maintenance Details Card */}
+      {isServerOffline && (
+        <div style={{
+          background: '#2a1a1a',
+          border: '1px solid #7f1d1d',
+          borderRadius: '16px',
+          padding: '24px',
+          marginTop: '16px',
+          textAlign: 'center',
+          color: '#fca5a5'
+        }}>
+          <div style={{ fontSize: 36, marginBottom: 12 }}>🛠️</div>
+          <h3 style={{ margin: '0 0 8px', fontSize: 18, color: '#f87171' }}>Signaling Server Offline</h3>
+          <p style={{ margin: '0 0 16px', fontSize: 13, color: '#fca5a5', lineHeight: 1.5 }}>
+            The AudioSync backend server is currently offline or undergoing maintenance. Please check back shortly.
+          </p>
+          <button
+            style={{
+              background: '#b91c1c',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '8px',
+              padding: '10px 20px',
+              fontSize: 14,
+              fontWeight: 600,
+              cursor: 'pointer'
+            }}
+            onClick={() => window.location.reload()}
+          >
+            🔄 Reconnect Server
+          </button>
+        </div>
+      )}
 
       {/* Audio unlock — shown when connected but not yet tapped.
           MUST be a real user tap so the <audio> element can call .play() */}
